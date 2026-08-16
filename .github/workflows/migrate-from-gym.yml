@@ -1,0 +1,266 @@
+name: Build Gym-Pro from Gym
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Gym-Pro
+        uses: actions/checkout@v4
+
+      - name: Copy source application
+        run: |
+          git clone --depth 1 https://github.com/7908nabaan-ai/Gym.git /tmp/gym-source
+          rsync -a --delete --exclude '.git' --exclude '.github' /tmp/gym-source/ ./
+
+      - name: Apply production hardening and product fixes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+
+          # Package metadata and scripts.
+          p = root / 'package.json'
+          text = p.read_text()
+          text = text.replace('"name": "react-example"', '"name": "gym-pro"')
+          text = text.replace('"lint": "tsc --noEmit"', '"lint": "tsc --noEmit",\n    "test": "tsx tests/calculations.test.ts"')
+          p.write_text(text)
+
+          # Secure, bounded, configurable Gemini server. No browser-held secret is required;
+          # origin checks + per-IP rate limits protect the unauthenticated prototype API.
+          server = '''import express, { Request, Response, NextFunction } from "express";
+          import path from "path";
+          import dotenv from "dotenv";
+          import { GoogleGenAI } from "@google/genai";
+
+          dotenv.config();
+
+          const app = express();
+          const PORT = Number(process.env.PORT || 3000);
+          const MAX_BODY = process.env.MAX_AI_BODY_BYTES || "512kb";
+          const AI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+          const RATE_WINDOW_MS = Number(process.env.AI_RATE_WINDOW_MS || 60_000);
+          const RATE_MAX = Number(process.env.AI_RATE_MAX || 8);
+          const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean);
+
+          app.disable("x-powered-by");
+          app.use(express.json({ limit: MAX_BODY, strict: true }));
+
+          const buckets = new Map<string, { start: number; count: number }>();
+          function clientKey(req: Request): string {
+            return (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) || req.ip || "unknown";
+          }
+          function rateLimit(req: Request, res: Response, next: NextFunction) {
+            const now = Date.now();
+            const key = clientKey(req);
+            const current = buckets.get(key);
+            if (!current || now - current.start >= RATE_WINDOW_MS) {
+              buckets.set(key, { start: now, count: 1 });
+              return next();
+            }
+            current.count += 1;
+            if (current.count > RATE_MAX) {
+              const retryAfter = Math.ceil((RATE_WINDOW_MS - (now - current.start)) / 1000);
+              res.setHeader("Retry-After", String(retryAfter));
+              return res.status(429).json({ status: "error", error: "Too many AI requests. Please try again shortly." });
+            }
+            return next();
+          }
+
+          function originGuard(req: Request, res: Response, next: NextFunction) {
+            if (!ALLOWED_ORIGINS.length) return next();
+            const origin = req.headers.origin;
+            if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+              return res.status(403).json({ status: "error", error: "Origin not allowed." });
+            }
+            return next();
+          }
+
+          let aiClient: GoogleGenAI | null = null;
+          function getAi(): GoogleGenAI {
+            if (!aiClient) {
+              const apiKey = process.env.GEMINI_API_KEY;
+              if (!apiKey) throw new Error("GEMINI_API_KEY environment variable is missing");
+              aiClient = new GoogleGenAI({ apiKey, httpOptions: { headers: { "User-Agent": "gym-pro" } } });
+            }
+            return aiClient;
+          }
+
+          function finiteNumber(value: unknown, min: number, max: number): boolean {
+            return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max;
+          }
+
+          function validateRequest(body: any): string | null {
+            if (!body || typeof body !== "object") return "Invalid request body.";
+            const { userData, progressLogs, calculationResults, question } = body;
+            if (!userData || typeof userData !== "object") return "userData is required.";
+            if (!calculationResults || typeof calculationResults !== "object") return "calculationResults is required.";
+            if (progressLogs !== undefined && (!Array.isArray(progressLogs) || progressLogs.length > 100)) return "progressLogs must contain at most 100 entries.";
+            if (question !== undefined && (typeof question !== "string" || question.length > 1000)) return "question is invalid or too long.";
+            if (!finiteNumber(userData.age, 13, 100)) return "Age is outside the supported range.";
+            if (!finiteNumber(userData.heightCm, 100, 250)) return "Height is outside the supported range.";
+            if (!finiteNumber(userData.currentWeightKg, 30, 350)) return "Weight is outside the supported range.";
+            if (!finiteNumber(userData.bodyFatPercentage, 2, 60)) return "Body-fat percentage is outside the supported range.";
+            if (!finiteNumber(userData.trainingDaysPerWeek, 0, 7)) return "Training frequency is invalid.";
+            return null;
+          }
+
+          app.get("/api/health", (_req, res) => res.json({ status: "ok", model: AI_MODEL, timestamp: new Date().toISOString() }));
+
+          app.post("/api/gemini/analyze-progress", rateLimit, originGuard, async (req, res) => {
+            const validationError = validateRequest(req.body);
+            if (validationError) return res.status(400).json({ status: "error", error: validationError });
+            try {
+              const { userData, progressLogs, calculationResults, question } = req.body;
+              const prompt = `You are an evidence-aware sports-science coach. Treat all calculated values as estimates, not diagnoses or biological certainties. Never claim a precise genetic ceiling. Clearly label assumptions, uncertainty, and recommendations. Do not diagnose medical conditions.\n\nPROFILE:\n${JSON.stringify(userData)}\n\nCALCULATIONS:\n${JSON.stringify(calculationResults)}\n\nRECENT LOGS:\n${JSON.stringify((progressLogs || []).slice(-10))}\n\nQUESTION:\n${question || "Provide a concise progress audit."}\n\nReturn ONLY valid JSON with this shape: {"summary":"string","assessment":["string"],"nutrition":["string"],"training":["string"],"recommendations":["string"],"warnings":["string"]}. Keep each item concise. Distinguish measured facts from estimates.`;
+
+              const response = await getAi().models.generateContent({ model: AI_MODEL, contents: prompt });
+              const raw = response.text?.trim() || "";
+              let analysis: unknown = null;
+              try { analysis = JSON.parse(raw.replace(/^```json\\s*/i, "").replace(/\\s*```$/, "")); } catch { analysis = { summary: raw, assessment: [], nutrition: [], training: [], recommendations: [], warnings: [] }; }
+              return res.json({ status: "success", analysis });
+            } catch (error: any) {
+              console.error("Gemini API Error:", error?.message || error);
+              return res.status(502).json({ status: "error", error: "AI coaching service is temporarily unavailable." });
+            }
+          });
+
+          app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+            if (err?.type === "entity.too.large") return res.status(413).json({ status: "error", error: "Request is too large." });
+            return res.status(500).json({ status: "error", error: "Unexpected server error." });
+          });
+
+          async function startServer() {
+            if (process.env.NODE_ENV !== "production") {
+              const { createServer: createViteServer } = await import("vite");
+              const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+              app.use(vite.middlewares);
+            } else {
+              const distPath = path.join(process.cwd(), "dist");
+              app.use(express.static(distPath));
+              app.get("*", (_req, res) => res.sendFile(path.join(distPath, "index.html")));
+            }
+            app.listen(PORT, "0.0.0.0", () => console.log(`Gym-Pro server listening on ${PORT}`));
+          }
+          startServer();
+          '''
+          (root / 'server.ts').write_text(server)
+
+          # Replace fragile AI response parsing and correct the displayed model source.
+          ai = root / 'src/components/AiCoachInsights.tsx'
+          ai_text = ai.read_text()
+          ai_text = ai_text.replace('import { Sparkles, Send, Bot, Loader2, CheckCircle2, AlertCircle, HelpCircle } from \'lucide-react\';', 'import { Sparkles, Send, Bot, Loader2, CheckCircle2, AlertCircle } from \'lucide-react\';')
+          ai_text = ai_text.replace('const [analysis, setAnalysis] = useState<string | null>(null);', 'const [analysis, setAnalysis] = useState<any | null>(null);')
+          ai_text = ai_text.replace('setAnalysis(data.analysis);', 'setAnalysis(data.analysis);')
+          ai_text = ai_text.replace('Powered by Gemini 2.5 Flash — analyzing your physiological parameters, progress logs, and macro partition', 'AI coaching — analyzing your physiological parameters, progress logs, and calculated estimates')
+          start = ai_text.find('          <div className="prose prose-invert prose-sm max-w-none space-y-3 text-zinc-300 leading-relaxed font-sans">')
+          end = ai_text.find('          </div>\n        </div>', start)
+          if start != -1 and end != -1:
+              renderer = '''          <div className="space-y-4 text-xs text-zinc-300 leading-relaxed">
+            {typeof analysis === 'string' ? <p>{analysis}</p> : (
+              <>
+                <p className="text-sm text-white font-semibold">{analysis.summary}</p>
+                {[
+                  ['Assessment', analysis.assessment],
+                  ['Nutrition', analysis.nutrition],
+                  ['Training', analysis.training],
+                  ['Recommendations', analysis.recommendations],
+                  ['Warnings', analysis.warnings],
+                ].map(([title, items]: any) => items?.length ? (
+                  <section key={title}>
+                    <h4 className="text-lime-400 font-black text-sm uppercase tracking-wide mb-2">{title}</h4>
+                    <ul className="space-y-1.5">{items.map((item: string, i: number) => <li key={i} className="flex gap-2"><span className="text-lime-400">•</span><span>{item}</span></li>)}</ul>
+                  </section>
+                ) : null)}
+              </>
+            )}
+            <p className="text-[11px] text-zinc-500 border-t border-zinc-800 pt-3">Educational coaching only. Estimates depend on measurement quality and individual response; this is not medical advice.</p>
+          </div>'''
+              ai_text = ai_text[:start] + renderer + ai_text[end + len('          </div>'):]
+          ai.write_text(ai_text)
+
+          # Safer labels and claims in the muscle-growth UI.
+          mg = root / 'src/components/MuscleGrowthSection.tsx'
+          mg_text = mg.read_text()
+          replacements = {
+              'Natural Ceiling (25.0)': 'FFMI reference (25.0)',
+              'Casey Butt MMP Limit': 'Estimated Muscular Potential',
+              'Genetic Max': 'Population Estimate',
+              'Max Drug-Free Lean Mass at your frame': 'Estimated lean-mass potential at the selected body-fat target',
+              'Casey Butt Natural Muscle Circumference Limits': 'Estimated Frame-Based Muscle Circumference Reference',
+              'Calculated from your wrist': 'Estimated from your wrist',
+              'Target Body Fat: 8-10% (Contest/Lean)': 'Reference target: 8–10% body fat',
+              'Novice lifters synthesize ~70-80% of weight gain as lean tissue during a moderate caloric surplus, while advanced lifters synthesize ~35-50%. Setting a surplus between +150 to +300 kcal/day prevents unwanted adipose tissue accumulation.': 'Nutrient partitioning varies substantially between individuals and training stages. Use these projections as planning estimates, then calibrate against 2–4 week weight, waist, and performance trends rather than treating them as precise predictions.',
+          }
+          for a,b in replacements.items(): mg_text = mg_text.replace(a,b)
+          mg.write_text(mg_text)
+
+          # Make growth velocity explicitly a range instead of a single promised outcome.
+          calc = root / 'src/utils/calculations.ts'
+          c = calc.read_text()
+          old = re.search(r'export function calculateMuscleGrowthVelocity\([\s\S]*?\n}\n\nexport function calculateComprehensiveMetrics', c)
+          if old:
+              new = '''export function calculateMuscleGrowthVelocity(\n  experienceLevel: string,\n  weightKg: number,\n  _trainingYears: number\n): {\n  monthlyRatePercent: number;\n  monthlyGainKg: number;\n  annualGainKg: number;\n  monthlyRangeKg: [number, number];\n  annualRangeKg: [number, number];\n} {\n  // Planning ranges inspired by common evidence-based coaching heuristics.\n  // They are not guaranteed rates of muscle gain.\n  const ranges: Record<string, [number, number]> = {\n    novice: [0.75, 1.25],\n    intermediate: [0.50, 0.75],\n    advanced: [0.25, 0.50],\n    elite: [0.10, 0.25],\n  };\n  const [lowPct, highPct] = ranges[experienceLevel] || ranges.intermediate;\n  const midpoint = (lowPct + highPct) / 2;\n  const monthlyRangeKg: [number, number] = [\n    Math.round(weightKg * lowPct / 100 * 100) / 100,\n    Math.round(weightKg * highPct / 100 * 100) / 100,\n  ];\n  const monthlyGainKg = Math.round(weightKg * midpoint / 100 * 100) / 100;\n  const annualRangeKg: [number, number] = [\n    Math.round(monthlyRangeKg[0] * 12 * 10) / 10,\n    Math.round(monthlyRangeKg[1] * 12 * 10) / 10,\n  ];\n  return { monthlyRatePercent: midpoint, monthlyGainKg, annualGainKg: Math.round(monthlyGainKg * 12 * 10) / 10, monthlyRangeKg, annualRangeKg };\n}\n\nexport function calculateComprehensiveMetrics'''
+              c = c[:old.start()] + new + c[old.end():]
+          calc.write_text(c)
+
+          # Add optional range fields without breaking existing consumers.
+          types = root / 'src/types.ts'
+          t = types.read_text()
+          marker = '  aragonMonthlyGainKg: number;\n'
+          if marker in t and 'aragonMonthlyGainRangeKg' not in t:
+              t = t.replace(marker, marker + '  aragonMonthlyGainRangeKg?: [number, number];\n  annualMuscleGainRangeKg?: [number, number];\n')
+          types.write_text(t)
+
+          # Inject ranges into comprehensive calculation result.
+          calc = root / 'src/utils/calculations.ts'
+          c = calc.read_text()
+          c = c.replace('    aragonMonthlyGainKg: growthVel.monthlyGainKg,\n', '    aragonMonthlyGainKg: growthVel.monthlyGainKg,\n    aragonMonthlyGainRangeKg: growthVel.monthlyRangeKg,\n    annualMuscleGainRangeKg: growthVel.annualRangeKg,\n')
+          calc.write_text(c)
+
+          # Add progress calibration and workout progression utilities as reusable foundations.
+          progress = root / 'src/utils/progressEngine.ts'
+          progress.parent.mkdir(parents=True, exist_ok=True)
+          progress.write_text('''import { ProgressLogEntry } from "../types";\n\nexport interface ProgressTrend {\n  weeks: number;\n  averageWeeklyWeightChangeKg: number;\n  averageCalories: number | null;\n  recommendation: "increase" | "maintain" | "decrease" | "insufficient-data";\n  calorieAdjustment: number;\n}\n\nexport function analyzeProgress(logs: ProgressLogEntry[], goal: string): ProgressTrend {\n  const sorted = [...logs].filter(l => Number.isFinite(l.weightKg)).sort((a,b) => a.date.localeCompare(b.date));\n  if (sorted.length < 3) return { weeks: 0, averageWeeklyWeightChangeKg: 0, averageCalories: null, recommendation: "insufficient-data", calorieAdjustment: 0 };\n  const first = sorted[0], last = sorted[sorted.length - 1];\n  const days = Math.max(1, (Date.parse(last.date) - Date.parse(first.date)) / 86400000);\n  const weeklyChange = ((last.weightKg - first.weightKg) / days) * 7;\n  const calories = sorted.map(x => x.caloriesConsumed).filter((x): x is number => Number.isFinite(x));\n  let recommendation: ProgressTrend["recommendation"] = "maintain";\n  let adjustment = 0;\n  if (/bulk/i.test(goal) && weeklyChange < 0.1) { recommendation = "increase"; adjustment = 100; }\n  else if (/bulk/i.test(goal) && weeklyChange > 0.4) { recommendation = "decrease"; adjustment = -100; }\n  else if (/cut/i.test(goal) && weeklyChange > -0.15) { recommendation = "decrease"; adjustment = -100; }\n  else if (/cut/i.test(goal) && weeklyChange < -0.8) { recommendation = "increase"; adjustment = 100; }\n  return { weeks: days / 7, averageWeeklyWeightChangeKg: Math.round(weeklyChange * 100) / 100, averageCalories: calories.length ? Math.round(calories.reduce((a,b) => a+b, 0) / calories.length) : null, recommendation, calorieAdjustment: adjustment };\n}\n''')
+
+          workout = root / 'src/utils/workoutProgression.ts'
+          workout.write_text('''export interface SetPerformance { weightKg: number; reps: number; rir?: number; }\nexport interface ProgressionDecision { nextWeightKg: number; targetReps: number; reason: string; }\n\nexport function recommendNextLoad(last: SetPerformance, repMin: number, repMax: number, incrementKg = 2.5): ProgressionDecision {\n  const rir = last.rir ?? 2;\n  if (last.reps >= repMax && rir >= 2) return { nextWeightKg: Math.round((last.weightKg + incrementKg) * 10) / 10, targetReps: repMin, reason: "Top of rep range reached with adequate reps in reserve." };\n  if (last.rir <= 0 && last.reps < repMax) return { nextWeightKg: last.weightKg, targetReps: Math.min(repMax, last.reps + 1), reason: "Keep load stable while fatigue is high." };\n  return { nextWeightKg: last.weightKg, targetReps: Math.min(repMax, Math.max(repMin, last.reps + 1)), reason: "Add a rep before adding load." };\n}\n''')
+
+          # Basic executable regression tests.
+          tests = root / 'tests/calculations.test.ts'
+          tests.parent.mkdir(parents=True, exist_ok=True)
+          tests.write_text('''import assert from "node:assert/strict";\nimport { calculateBMR, calculateFFMI, calculateMuscleGrowthVelocity } from "../src/utils/calculations";\n\nconst bmr = calculateBMR(80, 180, 30, "male", 15);\nassert.ok(bmr.recommended > 1000 && bmr.recommended < 3000);\nconst ffmi = calculateFFMI(80, 180, 15);\nassert.ok(ffmi.lbmKg > 50 && ffmi.ffmi > 15);\nconst growth = calculateMuscleGrowthVelocity("intermediate", 80, 2);\nassert.ok(growth.monthlyRangeKg[0] < growth.monthlyRangeKg[1]);\nconsole.log("Gym-Pro calculation tests passed");\n''')
+
+          # Environment documentation.
+          env = root / '.env.example'
+          env.write_text('''GEMINI_API_KEY=your_api_key_here\nGEMINI_MODEL=gemini-2.5-flash\nPORT=3000\nMAX_AI_BODY_BYTES=512kb\nAI_RATE_WINDOW_MS=60000\nAI_RATE_MAX=8\n# Optional comma-separated browser origins, e.g. https://gym.example.com\nALLOWED_ORIGINS=\n''')
+
+          # Production-oriented README.
+          (root / 'README.md').write_text('''# Gym-Pro\n\nGym-Pro is an evidence-aware bodybuilding planning and progress application built from the original Gym project.\n\n## Improvements in this version\n\n- Bounded AI request payloads and per-client rate limiting\n- Optional origin allow-listing\n- Server-side validation of AI inputs\n- Configurable Gemini model via environment variable\n- Generic server error responses that do not expose provider errors\n- Structured AI coaching output with uncertainty/safety guidance\n- Muscle-gain planning ranges instead of guaranteed outcomes\n- More careful muscular-potential language\n- Progress-trend and calorie-calibration foundation\n- Workout-load progression foundation\n- Calculation regression tests\n\n## Run locally\n\n1. Copy `.env.example` to `.env` and set `GEMINI_API_KEY` if AI coaching is needed.\n2. Install dependencies with `npm install` or `bun install`.\n3. Run `npm run dev`.\n4. Run `npm run lint` and `npm test`.\n\n## Important\n\nFitness calculations are estimates. Individual response varies, and progress recommendations should be calibrated against multi-week trends. The AI coach is educational and is not medical advice.\n''')
+
+          # Replace the copied workflow directory with a minimal CI workflow so source actions
+          # cannot unexpectedly deploy from the new repository.
+          wf = root / '.github/workflows/ci.yml'
+          wf.parent.mkdir(parents=True, exist_ok=True)
+          wf.write_text('''name: CI\n\non:\n  push:\n  pull_request:\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: oven-sh/setup-bun@v2\n        with:\n          bun-version: latest\n      - run: bun install --frozen-lockfile\n      - run: bun run lint\n      - run: bun run test\n      - run: bun run build\n''')
+
+          print('Gym-Pro migration complete')
+          PY
+
+      - name: Commit rebuilt application
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Build Gym-Pro with production hardening and calculation improvements" || exit 0
+          git push origin main
